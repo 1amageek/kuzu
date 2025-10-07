@@ -46,6 +46,9 @@ public:
 
     void checkpoint(main::ClientContext& clientContext);
 
+    common::transaction_t getLastTimestamp() const { return lastTimestamp; }
+    void setLastTimestamp(common::transaction_t timestamp) { lastTimestamp = timestamp; }
+
     static TransactionManager* Get(const main::ClientContext& context);
 
 private:
