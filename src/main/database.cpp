@@ -133,8 +133,18 @@ void Database::initMembers(std::string_view dbPath, construct_bm_func_t initBmFu
         extensionManager->autoLoadLinkedExtensions(&clientContext);
         return;
     }
-    StorageManager::recover(clientContext, dbConfig.throwOnWalReplayFailure,
-        dbConfig.enableChecksums);
+    // Set recovery flag before WAL replay to signal extensions to load synchronously
+    dbLifeCycleManager->isRecoveryInProgress.store(true, std::memory_order_release);
+    try {
+        StorageManager::recover(clientContext, dbConfig.throwOnWalReplayFailure,
+            dbConfig.enableChecksums);
+        // Clear recovery flag after WAL replay completes
+        dbLifeCycleManager->isRecoveryInProgress.store(false, std::memory_order_release);
+    } catch (...) {
+        // Ensure flag is cleared even on exception
+        dbLifeCycleManager->isRecoveryInProgress.store(false, std::memory_order_release);
+        throw;
+    }
 
     // Load extensions after recovery (WAL replay) completes
     // This ensures no background threads compete with recovery process
