@@ -3,6 +3,7 @@
 #include "catalog/catalog.h"
 #include "catalog/fts_index_catalog_entry.h"
 #include "index/fts_update_state.h"
+#include "extension/extension.h"
 #include "re2.h"
 #include "utils/fts_utils.h"
 
@@ -200,8 +201,8 @@ void FTSIndex::delete_(Transaction* transaction, const ValueVector& nodeIDVector
 
 void FTSIndex::finalize(main::ClientContext* context) {
     auto& ftsStorageInfo = storageInfo->cast<FTSStorageInfo>();
-    const auto numTotalRows =
-        internalTableInfo.table->getNumTotalRows(&DUMMY_CHECKPOINT_TRANSACTION);
+    const auto numTotalRows = internalTableInfo.table->getNumTotalRows(
+        extension::getExtensionCheckpointTransaction());
     if (numTotalRows == ftsStorageInfo.numCheckpointedNodes) {
         return;
     }
@@ -227,17 +228,17 @@ void FTSIndex::checkpoint(main::ClientContext* context, storage::PageAllocator& 
     KU_ASSERT(!context->isInMemory());
     auto catalog = catalog::Catalog::Get(*context);
     internalTableInfo.docTable->checkpoint(context,
-        catalog->getTableCatalogEntry(&DUMMY_CHECKPOINT_TRANSACTION,
+        catalog->getTableCatalogEntry(extension::getExtensionCheckpointTransaction(),
             internalTableInfo.docTable->getTableID()),
         pageAllocator);
     internalTableInfo.termsTable->checkpoint(context,
-        catalog->getTableCatalogEntry(&DUMMY_CHECKPOINT_TRANSACTION,
+        catalog->getTableCatalogEntry(extension::getExtensionCheckpointTransaction(),
             internalTableInfo.termsTable->getTableID()),
         pageAllocator);
     auto appearsInTableName =
         FTSUtils::getAppearsInTableName(internalTableInfo.table->getTableID(), indexInfo.name);
-    auto appearsInTableEntry =
-        catalog->getTableCatalogEntry(&DUMMY_CHECKPOINT_TRANSACTION, appearsInTableName);
+    auto appearsInTableEntry = catalog->getTableCatalogEntry(
+        extension::getExtensionCheckpointTransaction(), appearsInTableName);
     internalTableInfo.appearsInfoTable->checkpoint(context, appearsInTableEntry, pageAllocator);
 }
 
