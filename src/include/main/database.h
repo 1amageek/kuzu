@@ -220,10 +220,10 @@ public:
     }
 
     // Internal method for VectorExtension to notify loading completion
-    void notifyVectorIndexLoadComplete(bool success, const std::string& errorMsg = "");
+    KUZU_API void notifyVectorIndexLoadComplete(bool success, const std::string& errorMsg = "");
 
     // Register or replace background vector index loader thread
-    void startVectorIndexLoader(std::thread loaderThread);
+    KUZU_API void startVectorIndexLoader(std::thread loaderThread);
 
     // Public members for background loading coordination (thread-safe by design)
     std::atomic<bool> vectorIndexLoadCancelled{false};

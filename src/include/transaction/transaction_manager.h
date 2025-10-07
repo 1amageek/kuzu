@@ -39,10 +39,10 @@ public:
         initCheckpointerFunc = initCheckpointer;
     }
 
-    Transaction* beginTransaction(main::ClientContext& clientContext, TransactionType type);
+    KUZU_API Transaction* beginTransaction(main::ClientContext& clientContext, TransactionType type);
 
-    void commit(main::ClientContext& clientContext, Transaction* transaction);
-    void rollback(main::ClientContext& clientContext, Transaction* transaction);
+    KUZU_API void commit(main::ClientContext& clientContext, Transaction* transaction);
+    KUZU_API void rollback(main::ClientContext& clientContext, Transaction* transaction);
 
     void checkpoint(main::ClientContext& clientContext);
 
