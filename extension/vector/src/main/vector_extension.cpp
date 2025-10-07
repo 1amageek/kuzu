@@ -5,40 +5,198 @@
 #include "main/client_context.h"
 #include "main/database.h"
 #include "storage/storage_manager.h"
+#include "transaction/transaction_manager.h"
+
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <mutex>
 
 namespace kuzu {
 namespace vector_extension {
 
-static void initHNSWEntries(main::ClientContext* context) {
+static void initHNSWEntries(main::ClientContext* context, transaction::Transaction* txn) {
     auto storageManager = storage::StorageManager::Get(*context);
     auto catalog = catalog::Catalog::Get(*context);
-    for (auto& indexEntry : catalog->getIndexEntries(transaction::Transaction::Get(*context))) {
+    auto* database = context->getDatabase();
+
+    // Collect HNSW indexes
+    std::vector<catalog::IndexCatalogEntry*> hnswIndexes;
+    for (auto& indexEntry : catalog->getIndexEntries(txn)) {
+        // Cancellation check during collection
+        if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+            return;
+        }
+
         if (indexEntry->getIndexType() == HNSWIndexCatalogEntry::TYPE_NAME &&
             !indexEntry->isLoaded()) {
-            indexEntry->setAuxInfo(HNSWIndexAuxInfo::deserialize(indexEntry->getAuxBufferReader()));
-            // Should load the index in storage side as well.
-            auto& nodeTable =
-                storageManager->getTable(indexEntry->getTableID())->cast<storage::NodeTable>();
-            auto optionalIndex = nodeTable.getIndexHolder(indexEntry->getIndexName());
-            KU_ASSERT_UNCONDITIONAL(
-                optionalIndex.has_value() && !optionalIndex.value().get().isLoaded());
-            auto& unloadedIndex = optionalIndex.value().get();
-            unloadedIndex.load(context, storageManager);
+            hnswIndexes.push_back(indexEntry);
         }
+    }
+
+    if (hnswIndexes.empty()) {
+        return;
+    }
+
+    // Parallel loading with thread pool
+    size_t numThreads = std::min(
+        static_cast<size_t>(context->getDatabase()->getConfig().maxNumThreads),
+        hnswIndexes.size()
+    );
+
+    std::atomic<size_t> nextIndexToProcess{0};
+    std::vector<std::thread> workers;
+    std::mutex errorMutex;
+    std::vector<std::string> errors;
+
+    // Create fixed number of worker threads
+    for (size_t i = 0; i < numThreads; ++i) {
+        workers.emplace_back([&, database]() {
+            while (true) {
+                // Cancellation check at loop start
+                if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+                    break;
+                }
+
+                size_t idx = nextIndexToProcess.fetch_add(1);
+                if (idx >= hnswIndexes.size()) {
+                    break;
+                }
+
+                auto* indexEntry = hnswIndexes[idx];
+                try {
+                    // Cancellation check before loading
+                    if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+                        break;
+                    }
+
+                    // Deserialize aux info
+                    indexEntry->setAuxInfo(
+                        HNSWIndexAuxInfo::deserialize(indexEntry->getAuxBufferReader())
+                    );
+
+                    // Load index in storage
+                    auto& nodeTable = storageManager->getTable(indexEntry->getTableID())
+                        ->cast<storage::NodeTable>();
+                    auto optionalIndex = nodeTable.getIndexHolder(indexEntry->getIndexName());
+
+                    if (optionalIndex.has_value()) {
+                        auto& indexHolder = optionalIndex.value().get();
+                        if (!indexHolder.isLoaded()) {
+                            // Cancellation check before expensive loading
+                            if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+                                break;
+                            }
+
+                            indexHolder.load(context, storageManager, indexEntry);
+                        }
+                    }
+
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    errors.push_back(indexEntry->getIndexName() + ": " + e.what());
+                }
+            }
+        });
+    }
+
+    // Wait for all threads
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    // Handle errors only if not cancelled
+    if (!database->vectorIndexLoadCancelled.load(std::memory_order_acquire) && !errors.empty()) {
+        std::string errorMsg = "HNSW index loading failed:\n";
+        for (const auto& error : errors) {
+            errorMsg += "  - " + error + "\n";
+        }
+        throw common::RuntimeException(errorMsg);
     }
 }
 
 void VectorExtension::load(main::ClientContext* context) {
     auto& db = *context->getDatabase();
+
+    // Register vector extension functions
     extension::ExtensionUtils::addTableFunc<QueryVectorIndexFunction>(db);
     extension::ExtensionUtils::addInternalStandaloneTableFunc<InternalCreateHNSWIndexFunction>(db);
-    extension::ExtensionUtils::addInternalStandaloneTableFunc<InternalFinalizeHNSWIndexFunction>(
-        db);
+    extension::ExtensionUtils::addInternalStandaloneTableFunc<InternalFinalizeHNSWIndexFunction>(db);
     extension::ExtensionUtils::addStandaloneTableFunc<CreateVectorIndexFunction>(db);
     extension::ExtensionUtils::addInternalStandaloneTableFunc<InternalDropHNSWIndexFunction>(db);
     extension::ExtensionUtils::addStandaloneTableFunc<DropVectorIndexFunction>(db);
     extension::ExtensionUtils::registerIndexType(db, OnDiskHNSWIndex::getIndexType());
-    initHNSWEntries(context);
+
+    // Capture Database* and shared_ptr to lifecycle manager
+    auto* database = context->getDatabase();
+    auto lifeCycleManager = database->dbLifeCycleManager;
+
+    // Start background loading
+    std::thread loaderThread([database, lifeCycleManager]() {
+        try {
+            // CRITICAL SECTION: Check and create ClientContext atomically
+            // This prevents TOCTOU race with destructor
+            main::ClientContext* bgContextPtr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(database->backgroundThreadStartMutex);
+
+                // Check if Database already closed
+                if (lifeCycleManager->isDatabaseClosed) {
+                    return;
+                }
+
+                // Create ClientContext while holding lock
+                bgContextPtr = new main::ClientContext(database);
+            }
+            // Lock released: Destructor can now proceed if needed
+
+            // Wrap in unique_ptr for automatic cleanup
+            std::unique_ptr<main::ClientContext> bgContext(bgContextPtr);
+
+            // Early exit if cancelled
+            if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            // Begin READ_ONLY transaction
+            auto* txn = database->getTransactionManager()->beginTransaction(
+                *bgContext,
+                transaction::TransactionType::READ_ONLY
+            );
+
+            // Early exit if cancelled
+            if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+                database->getTransactionManager()->rollback(*bgContext, txn);
+                return;
+            }
+
+            // Execute HNSW loading
+            initHNSWEntries(bgContext.get(), txn);
+
+            // Check cancellation before committing
+            if (database->vectorIndexLoadCancelled.load(std::memory_order_acquire)) {
+                database->getTransactionManager()->rollback(*bgContext, txn);
+                return;
+            }
+
+            // Commit transaction
+            database->getTransactionManager()->commit(*bgContext, txn);
+
+            // Notify completion (internally checks vectorIndexLoadCancelled)
+            database->notifyVectorIndexLoadComplete(true);
+
+        } catch (const std::exception& e) {
+            // Notify error (internally checks vectorIndexLoadCancelled)
+            database->notifyVectorIndexLoadComplete(false, e.what());
+
+        } catch (...) {
+            // Notify error (internally checks vectorIndexLoadCancelled)
+            database->notifyVectorIndexLoadComplete(false, "Unknown error");
+        }
+
+    });
+
+    database->startVectorIndexLoader(std::move(loaderThread));
 }
 
 } // namespace vector_extension

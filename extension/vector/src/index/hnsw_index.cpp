@@ -468,16 +468,18 @@ OnDiskHNSWIndex::OnDiskHNSWIndex(const main::ClientContext* context, IndexInfo i
 }
 
 std::unique_ptr<Index> OnDiskHNSWIndex::load(main::ClientContext* context, StorageManager*,
-    IndexInfo indexInfo, std::span<uint8_t> storageInfoBuffer) {
+    const catalog::IndexCatalogEntry* catalogEntry, IndexInfo indexInfo,
+    std::span<uint8_t> storageInfoBuffer) {
     auto reader =
         std::make_unique<common::BufferReader>(storageInfoBuffer.data(), storageInfoBuffer.size());
     auto storageInfo = HNSWStorageInfo::deserialize(std::move(reader));
-    const auto catalog = catalog::Catalog::Get(*context);
-    const auto transaction = Transaction::Get(*context);
-    const auto indexEntry = catalog->getIndex(transaction, indexInfo.tableID, indexInfo.name);
-    const auto auxInfo = indexEntry->getAuxInfo().cast<HNSWIndexAuxInfo>();
-    return std::make_unique<OnDiskHNSWIndex>(context, std::move(indexInfo), std::move(storageInfo),
+
+    KU_ASSERT(catalogEntry != nullptr);
+    const auto auxInfo = catalogEntry->getAuxInfo().cast<HNSWIndexAuxInfo>();
+
+    auto result = std::make_unique<OnDiskHNSWIndex>(context, std::move(indexInfo), std::move(storageInfo),
         auxInfo.config.copy());
+    return result;
 }
 
 std::vector<NodeWithDistance> OnDiskHNSWIndex::search(Transaction* transaction,
